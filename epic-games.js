@@ -1,4 +1,4 @@
-import { firefox } from 'playwright-firefox'; // stealth plugin needs no outdated playwright-extra
+import { chromium } from 'patchright'; // use patchright to bypass Cloudflare detection
 import { authenticator } from 'otplib';
 import chalk from 'chalk';
 import path from 'path';
@@ -17,29 +17,16 @@ const db = await jsonDb('epic-games.json', {});
 
 if (cfg.time) console.time('startup');
 
-const browserPrefs = path.join(cfg.dir.browser, 'prefs.js');
-if (existsSync(browserPrefs)) {
-  console.log('Adding webgl.disabled to', browserPrefs);
-  appendFileSync(browserPrefs, 'user_pref("webgl.disabled", true);'); // apparently Firefox removes duplicates (and sorts), so no problem appending every time
-} else {
-  console.log(browserPrefs, 'does not exist yet, will patch it on next run. Restart the script if you get a captcha.');
-}
-
-// https://playwright.dev/docs/auth#multi-factor-authentication
-const context = await firefox.launchPersistentContext(cfg.dir.browser, {
+// Use patchright + real Chrome to bypass Cloudflare detection
+const context = await chromium.launchPersistentContext(cfg.dir.browser + '-chrome', {
+  channel: 'chrome', // use the real Chrome installed on the system
   headless: cfg.headless,
   viewport: { width: cfg.width, height: cfg.height },
-  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0', // see replace of Headless in util.newStealthContext. TODO Windows UA enough to avoid 'device not supported'? update if browser is updated?
-  // userAgent firefox (macOS): Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:106.0) Gecko/20100101 Firefox/106.0
-  // userAgent firefox (docker): Mozilla/5.0 (X11; Linux aarch64; rv:109.0) Gecko/20100101 Firefox/115.0
-  locale: 'en-US', // ignore OS locale to be sure to have english text for locators
-  recordVideo: cfg.record ? { dir: 'data/record/', size: { width: cfg.width, height: cfg.height } } : undefined, // will record a .webm video for each page navigated; without size, video would be scaled down to fit 800x800
-  recordHar: cfg.record ? { path: `data/record/eg-${filenamify(datetime())}.har` } : undefined, // will record a HAR file with network requests and responses; can be imported in Chrome devtools
-  handleSIGINT: false, // have to handle ourselves and call context.close(), otherwise recordings from above won't be saved
-  // user settings for firefox have to be put in $BROWSER_DIR/user.js
-  args: [ // https://wiki.mozilla.org/Firefox/CommandLineOptions
-    // '-kiosk',
-  ],
+  locale: 'en-US',
+  recordVideo: cfg.record ? { dir: 'data/record/', size: { width: cfg.width, height: cfg.height } } : undefined,
+  recordHar: cfg.record ? { path: `data/record/eg-${filenamify(datetime())}.har` } : undefined,
+  handleSIGINT: false,
+  args: [],
 });
 
 handleSIGINT(context);
@@ -71,19 +58,29 @@ try {
     { name: 'HasAcceptedAgeGates', value: 'USK:9007199254740991,general:18,EPIC SUGGESTED RATING:18', domain: 'store.epicgames.com', path: '/' }, // gets rid of 'To continue, please provide your date of birth', https://github.com/vogler/free-games-claimer/issues/275, USK number doesn't seem to matter, cookie from 'Fallout 3: Game of the Year Edition'
   ]);
 
-  await page.goto(URL_CLAIM, { waitUntil: 'domcontentloaded' }); // 'domcontentloaded' faster than default 'load' https://playwright.dev/docs/api/class-page#page-goto
+  await page.goto(URL_CLAIM, { waitUntil: 'domcontentloaded', timeout: cfg.timeout }); // 'domcontentloaded' faster than default 'load' https://playwright.dev/docs/api/class-page#page-goto
 
   if (cfg.time) console.timeEnd('startup');
   if (cfg.time) console.time('login');
 
   // page.click('button:has-text("Accept All Cookies")').catch(_ => { }); // Not needed anymore since we set the cookie above. Clicking this did not always work since the message was animated in too slowly.
 
-  while (await page.locator('egs-navigation').getAttribute('isloggedin') != 'true') {
+  // Wait for Epic's nav component to be present (SPA may hydrate after domcontentloaded). If this times out, Epic may have changed the page structure.
+  const navLocator = page.locator('egs-navigation').first();
+  try {
+    await navLocator.waitFor({ state: 'attached', timeout: cfg.timeout });
+  } catch (e) {
+    throw new Error(`egs-navigation not found on page (Epic may have changed the store). ${e.message}`);
+  }
+
+  const getNavAttr = (attr, timeoutMs = cfg.timeout) => navLocator.getAttribute(attr, { timeout: timeoutMs });
+
+  while (await getNavAttr('isloggedin') != 'true') {
     console.error('Not signed in anymore. Please login in the browser or here in the terminal.');
     if (cfg.novnc_port) console.info(`Open http://localhost:${cfg.novnc_port} to login inside the docker container.`);
     if (!cfg.debug) context.setDefaultTimeout(cfg.login_timeout); // give user some extra time to log in
     console.info(`Login timeout is ${cfg.login_timeout / 1000} seconds!`);
-    await page.goto(URL_LOGIN, { waitUntil: 'domcontentloaded' });
+    await page.goto(URL_LOGIN, { waitUntil: 'domcontentloaded', timeout: cfg.timeout });
     if (cfg.eg_email && cfg.eg_password) console.info('Using email and password from environment.');
     else console.info('Press ESC to skip the prompts if you want to login in the browser (not possible in headless mode).');
     const notifyBrowserLogin = async () => {
@@ -128,10 +125,12 @@ try {
         await page.click('button[type="submit"]');
       }).catch(_ => { });
     }
-    await page.waitForURL(URL_CLAIM);
+    await page.waitForURL(URL_CLAIM, { waitUntil: 'domcontentloaded', timeout: cfg.login_timeout });
     if (!cfg.debug) context.setDefaultTimeout(cfg.timeout);
+    // Re-wait for nav after redirect (page may have changed)
+    await navLocator.waitFor({ state: 'attached', timeout: cfg.timeout }).catch(() => {});
   }
-  user = await page.locator('egs-navigation').getAttribute('displayname'); // 'null' if !isloggedin
+  user = await getNavAttr('displayname'); // 'null' if !isloggedin
   console.log(`Signed in as ${user}`);
   db.data[user] ||= {};
   if (cfg.time) console.timeEnd('login');
@@ -150,13 +149,22 @@ try {
   // debug showed that in those cases the href was still correct, so we `goto` the urls instead of clicking.
   // Alternative: parse the json loaded to build the page https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions
   // i.e. filter data.Catalog.searchStore.elements for .promotions.promotionalOffers being set and build URL with .catalogNs.mappings[0].pageSlug or .urlSlug if not set to some wrong id like it was the case for spirit-of-the-north-f58a66 - this is also what's done here: https://github.com/claabs/epicgames-freegames-node/blob/938a9653ffd08b8284ea32cf01ac8727d25c5d4c/src/puppet/free-games.ts#L138-L213
-  const urlSlugs = await Promise.all((await game_loc.elementHandles()).map(a => a.getAttribute('href')));
-  const urls = urlSlugs.map(s => 'https://store.epicgames.com' + s);
+  const gameCount = await game_loc.count();
+  const urlSlugsValid = [];
+  for (let i = 0; i < gameCount; i++) {
+    try {
+      const href = await game_loc.nth(i).getAttribute('href', { timeout: cfg.timeout });
+      if (href) urlSlugsValid.push(href);
+    } catch (e) {
+      console.error(`Getting href for free game #${i + 1} failed:`, e.message);
+    }
+  }
+  const urls = urlSlugsValid.map(s => 'https://store.epicgames.com' + s);
   console.log('Free games:', urls);
 
   for (const url of urls) {
     if (cfg.time) console.time('claim game');
-    await page.goto(url); // , { waitUntil: 'domcontentloaded' });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: cfg.timeout });
     const purchaseBtn = page.locator('button[data-testid="purchase-cta-button"] >> :has-text("e"), :has-text("i")').first(); // when loading, the button text is empty -> need to wait for some text {'get', 'in library', 'requires base game'} -> just wait for e or i to not be too specific; :text-matches("\w+") somehow didn't work - https://github.com/vogler/free-games-claimer/issues/375
     await purchaseBtn.waitFor();
     const btnText = (await purchaseBtn.innerText()).toLowerCase(); // barrier to block until page is loaded
@@ -209,15 +217,49 @@ try {
       notify_game.status = 'requires base game';
       db.data[user][game_id].status ||= 'failed:requires-base-game';
       // TODO claim base game if it is free
-      const baseUrl = 'https://store.epicgames.com' + await page.locator('a:has-text("Overview")').getAttribute('href');
-      console.log('  Base game:', baseUrl);
-      // await page.click('a:has-text("Overview")');
-      // TODO handle this via function call for base game above since this will never terminate if DRYRUN=1
-      urls.push(baseUrl); // add base game to the list of games to claim
-      urls.push(url); // add add-on itself again
+      let baseUrl;
+      try {
+        const overviewHref = await page.locator('a:has-text("Overview")').first().getAttribute('href', { timeout: cfg.timeout });
+        baseUrl = overviewHref ? 'https://store.epicgames.com' + overviewHref : null;
+      } catch (e) {
+        console.error('  Could not get Overview link for base game:', e.message);
+        baseUrl = null;
+      }
+      if (baseUrl) {
+        console.log('  Base game:', baseUrl);
+        // await page.click('a:has-text("Overview")');
+        // TODO handle this via function call for base game above since this will never terminate if DRYRUN=1
+        urls.push(baseUrl); // add base game to the list of games to claim
+        urls.push(url); // add add-on itself again
+      }
     } else { // GET
       console.log('  Not in library yet! Click', btnText);
-      await purchaseBtn.click({ delay: 11 }); // got stuck here without delay (or mouse move), see #75, 1ms was also enough
+      // Best-effort scroll; Epic's page often has animations so "stable" may never happen – use short timeout and ignore failure
+      await purchaseBtn.scrollIntoViewIfNeeded({ timeout: cfg.timeout }).catch(() => {});
+      let clicked = false;
+      try {
+        await purchaseBtn.click({ delay: 11, timeout: cfg.timeout }); // got stuck here without delay (or mouse move), see #75
+        clicked = true;
+      } catch (e) {
+        if (e.name === 'TimeoutError') {
+          try {
+            console.log('  Click timed out, retrying with force.');
+            await purchaseBtn.click({ delay: 11, timeout: cfg.timeout, force: true });
+            clicked = true;
+          } catch (e2) {
+            if (e2.name === 'TimeoutError') {
+              console.log('  Force click timed out, using programmatic click.');
+              await purchaseBtn.evaluate(el => el && el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })));
+              await page.waitForTimeout(1500); // give modal time to open
+              clicked = true;
+            } else {
+              throw e2;
+            }
+          }
+        } else {
+          throw e;
+        }
+      }
 
       // click Continue if 'Device not supported. This product is not compatible with your current device.' - avoided by Windows userAgent?
       page.click('button:has-text("Continue")').catch(_ => { }); // needed since change from Chromium to Firefox?
@@ -234,11 +276,31 @@ try {
         await page.locator('button:has-text("Accept")').click();
       }).catch(_ => { });
 
-      // it then creates an iframe for the purchase
-      await page.waitForSelector('#webPurchaseContainer iframe'); // TODO needed?
+      // it then creates an iframe for the purchase (may not appear if click didn't open checkout)
+      let iframeVisible = false;
+      try {
+        await page.waitForSelector('#webPurchaseContainer iframe', { state: 'visible', timeout: cfg.timeout });
+        iframeVisible = true;
+      } catch (e) {
+        console.error('  Purchase iframe did not appear after click. Check page or try again.');
+      }
+      if (!iframeVisible) {
+        db.data[user][game_id].status = notify_game.status = 'failed:no-checkout-iframe';
+        if (cfg.time) console.timeEnd('claim game');
+        continue;
+      }
       const iframe = page.frameLocator('#webPurchaseContainer iframe');
       // skip game if unavailable in region, https://github.com/vogler/free-games-claimer/issues/46 TODO check games for account's region
-      if (await iframe.locator(':has-text("unavailable in your region")').count() > 0) {
+      let unavailableInRegion = false;
+      try {
+        unavailableInRegion = (await Promise.race([
+          iframe.locator(':has-text("unavailable in your region")').count(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), cfg.timeout))
+        ])) > 0;
+      } catch (_) {
+        // timeout or error – assume available
+      }
+      if (unavailableInRegion) {
         console.error('  This product is unavailable in your region!');
         db.data[user][game_id].status = notify_game.status = 'unavailable-in-region';
         if (cfg.time) console.timeEnd('claim game');
@@ -312,7 +374,13 @@ try {
   process.exitCode ||= 1;
   console.error('--- Exception:');
   console.error(error); // .toString()?
-  if (error.message && process.exitCode != 130) notify(`epic-games failed: ${error.message.split('\n')[0]}`);
+  if (error.message && process.exitCode != 130) {
+    const msg = error.message.split('\n')[0];
+    const hint = msg.includes('getAttribute') || msg.includes('egs-navigation')
+      ? ' (page slow or Epic store structure changed; try again or check for updates)'
+      : '';
+    notify(`epic-games failed: ${msg}${hint}`);
+  }
 } finally {
   await db.write(); // write out json db
   if (notify_games.filter(g => g.status == 'claimed' || g.status == 'failed').length) { // don't notify if all have status 'existed', 'manual', 'requires base game', 'unavailable-in-region', 'skipped'
