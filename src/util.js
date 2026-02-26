@@ -110,7 +110,32 @@ export const confirm = o => prompt({ type: 'confirm', message: 'Continue?', ...o
 import { execFile } from 'child_process';
 import { cfg } from './config.js';
 
+// Feishu webhook notification
+const notifyFeishu = async (text) => {
+  if (!cfg.feishu_webhook) return;
+  // strip HTML tags for plain text
+  const plain = text.replace(/<br>/g, '\n').replace(/<[^>]+>/g, '');
+  try {
+    const res = await fetch(cfg.feishu_webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        msg_type: 'text',
+        content: { text: plain },
+      }),
+    });
+    const data = await res.json();
+    if (data.code !== 0) console.error('Feishu notify error:', data.msg);
+    else if (cfg.debug) console.debug('Feishu notify sent.');
+  } catch (e) {
+    console.error('Feishu notify failed:', e.message);
+  }
+};
+
 export const notify = html => new Promise((resolve, reject) => {
+  // always try Feishu notification
+  notifyFeishu(html).catch(_ => {});
+
   if (!cfg.notify) {
     if (cfg.debug) console.debug('notify: NOTIFY is not set!');
     return resolve();

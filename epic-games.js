@@ -65,17 +65,7 @@ try {
 
   // page.click('button:has-text("Accept All Cookies")').catch(_ => { }); // Not needed anymore since we set the cookie above. Clicking this did not always work since the message was animated in too slowly.
 
-  // Wait for Epic's nav component to be present (SPA may hydrate after domcontentloaded). If this times out, Epic may have changed the page structure.
-  const navLocator = page.locator('egs-navigation').first();
-  try {
-    await navLocator.waitFor({ state: 'attached', timeout: cfg.timeout });
-  } catch (e) {
-    throw new Error(`egs-navigation not found on page (Epic may have changed the store). ${e.message}`);
-  }
-
-  const getNavAttr = (attr, timeoutMs = cfg.timeout) => navLocator.getAttribute(attr, { timeout: timeoutMs });
-
-  while (await getNavAttr('isloggedin') != 'true') {
+  while (await page.locator('egs-navigation').getAttribute('isloggedin') != 'true') {
     console.error('Not signed in anymore. Please login in the browser or here in the terminal.');
     if (cfg.novnc_port) console.info(`Open http://localhost:${cfg.novnc_port} to login inside the docker container.`);
     if (!cfg.debug) context.setDefaultTimeout(cfg.login_timeout); // give user some extra time to log in
@@ -127,10 +117,8 @@ try {
     }
     await page.waitForURL(URL_CLAIM, { waitUntil: 'domcontentloaded', timeout: cfg.login_timeout });
     if (!cfg.debug) context.setDefaultTimeout(cfg.timeout);
-    // Re-wait for nav after redirect (page may have changed)
-    await navLocator.waitFor({ state: 'attached', timeout: cfg.timeout }).catch(() => {});
   }
-  user = await getNavAttr('displayname'); // 'null' if !isloggedin
+  user = await page.locator('egs-navigation').getAttribute('displayname'); // 'null' if !isloggedin
   console.log(`Signed in as ${user}`);
   db.data[user] ||= {};
   if (cfg.time) console.timeEnd('login');
@@ -149,17 +137,8 @@ try {
   // debug showed that in those cases the href was still correct, so we `goto` the urls instead of clicking.
   // Alternative: parse the json loaded to build the page https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions
   // i.e. filter data.Catalog.searchStore.elements for .promotions.promotionalOffers being set and build URL with .catalogNs.mappings[0].pageSlug or .urlSlug if not set to some wrong id like it was the case for spirit-of-the-north-f58a66 - this is also what's done here: https://github.com/claabs/epicgames-freegames-node/blob/938a9653ffd08b8284ea32cf01ac8727d25c5d4c/src/puppet/free-games.ts#L138-L213
-  const gameCount = await game_loc.count();
-  const urlSlugsValid = [];
-  for (let i = 0; i < gameCount; i++) {
-    try {
-      const href = await game_loc.nth(i).getAttribute('href', { timeout: cfg.timeout });
-      if (href) urlSlugsValid.push(href);
-    } catch (e) {
-      console.error(`Getting href for free game #${i + 1} failed:`, e.message);
-    }
-  }
-  const urls = urlSlugsValid.map(s => 'https://store.epicgames.com' + s);
+  const urlSlugs = await Promise.all((await game_loc.elementHandles()).map(a => a.getAttribute('href')));
+  const urls = urlSlugs.map(s => 'https://store.epicgames.com' + s);
   console.log('Free games:', urls);
 
   for (const url of urls) {
@@ -217,49 +196,15 @@ try {
       notify_game.status = 'requires base game';
       db.data[user][game_id].status ||= 'failed:requires-base-game';
       // TODO claim base game if it is free
-      let baseUrl;
-      try {
-        const overviewHref = await page.locator('a:has-text("Overview")').first().getAttribute('href', { timeout: cfg.timeout });
-        baseUrl = overviewHref ? 'https://store.epicgames.com' + overviewHref : null;
-      } catch (e) {
-        console.error('  Could not get Overview link for base game:', e.message);
-        baseUrl = null;
-      }
-      if (baseUrl) {
-        console.log('  Base game:', baseUrl);
-        // await page.click('a:has-text("Overview")');
-        // TODO handle this via function call for base game above since this will never terminate if DRYRUN=1
-        urls.push(baseUrl); // add base game to the list of games to claim
-        urls.push(url); // add add-on itself again
-      }
+      const baseUrl = 'https://store.epicgames.com' + await page.locator('a:has-text("Overview")').getAttribute('href');
+      console.log('  Base game:', baseUrl);
+      // await page.click('a:has-text("Overview")');
+      // TODO handle this via function call for base game above since this will never terminate if DRYRUN=1
+      urls.push(baseUrl); // add base game to the list of games to claim
+      urls.push(url); // add add-on itself again
     } else { // GET
       console.log('  Not in library yet! Click', btnText);
-      // Best-effort scroll; Epic's page often has animations so "stable" may never happen – use short timeout and ignore failure
-      await purchaseBtn.scrollIntoViewIfNeeded({ timeout: cfg.timeout }).catch(() => {});
-      let clicked = false;
-      try {
-        await purchaseBtn.click({ delay: 11, timeout: cfg.timeout }); // got stuck here without delay (or mouse move), see #75
-        clicked = true;
-      } catch (e) {
-        if (e.name === 'TimeoutError') {
-          try {
-            console.log('  Click timed out, retrying with force.');
-            await purchaseBtn.click({ delay: 11, timeout: cfg.timeout, force: true });
-            clicked = true;
-          } catch (e2) {
-            if (e2.name === 'TimeoutError') {
-              console.log('  Force click timed out, using programmatic click.');
-              await purchaseBtn.evaluate(el => el && el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })));
-              await page.waitForTimeout(1500); // give modal time to open
-              clicked = true;
-            } else {
-              throw e2;
-            }
-          }
-        } else {
-          throw e;
-        }
-      }
+      await purchaseBtn.click({ delay: 11, timeout: cfg.login_timeout }); // longer timeout for element to become stable (animations)
 
       // click Continue if 'Device not supported. This product is not compatible with your current device.' - avoided by Windows userAgent?
       page.click('button:has-text("Continue")').catch(_ => { }); // needed since change from Chromium to Firefox?
@@ -276,31 +221,11 @@ try {
         await page.locator('button:has-text("Accept")').click();
       }).catch(_ => { });
 
-      // it then creates an iframe for the purchase (may not appear if click didn't open checkout)
-      let iframeVisible = false;
-      try {
-        await page.waitForSelector('#webPurchaseContainer iframe', { state: 'visible', timeout: cfg.timeout });
-        iframeVisible = true;
-      } catch (e) {
-        console.error('  Purchase iframe did not appear after click. Check page or try again.');
-      }
-      if (!iframeVisible) {
-        db.data[user][game_id].status = notify_game.status = 'failed:no-checkout-iframe';
-        if (cfg.time) console.timeEnd('claim game');
-        continue;
-      }
+      // it then creates an iframe for the purchase
+      await page.waitForSelector('#webPurchaseContainer iframe', { timeout: cfg.timeout }); // TODO needed?
       const iframe = page.frameLocator('#webPurchaseContainer iframe');
       // skip game if unavailable in region, https://github.com/vogler/free-games-claimer/issues/46 TODO check games for account's region
-      let unavailableInRegion = false;
-      try {
-        unavailableInRegion = (await Promise.race([
-          iframe.locator(':has-text("unavailable in your region")').count(),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), cfg.timeout))
-        ])) > 0;
-      } catch (_) {
-        // timeout or error – assume available
-      }
-      if (unavailableInRegion) {
+      if (await iframe.locator(':has-text("unavailable in your region")').count() > 0) {
         console.error('  This product is unavailable in your region!');
         db.data[user][game_id].status = notify_game.status = 'unavailable-in-region';
         if (cfg.time) console.timeEnd('claim game');
@@ -379,7 +304,7 @@ try {
     const hint = msg.includes('getAttribute') || msg.includes('egs-navigation')
       ? ' (page slow or Epic store structure changed; try again or check for updates)'
       : '';
-    notify(`epic-games failed: ${msg}${hint}`);
+    notify(`epic-games failed: ${msg}${hint}`); // hint improves log readability
   }
 } finally {
   await db.write(); // write out json db

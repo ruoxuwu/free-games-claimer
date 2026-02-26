@@ -22,6 +22,7 @@ export const cfg = {
   novnc_port: process.env.NOVNC_PORT, // running in docker if set
   notify: process.env.NOTIFY, // apprise notification services
   notify_title: process.env.NOTIFY_TITLE, // apprise notification title
+  feishu_webhook: process.env.FEISHU_WEBHOOK, // Feishu/Lark webhook URL
   get dir() { // avoids ReferenceError: Cannot access 'dataDir' before initialization
     return {
       browser: process.env.BROWSER_DIR || dataDir('browser'), // for multiple accounts or testing
